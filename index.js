@@ -1,87 +1,135 @@
-import TelegramBot from "node-telegram-bot-api";
-import axios from "axios";
-import fs from "fs";
-import path from "path";
-import express from "express";
-import "dotenv/config";
+require("dotenv").config();
+const { Telegraf } = require("telegraf");
+const axios = require("axios");
+const fs = require("fs");
+const express = require("express");
 
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
+// ====== ENV ======
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const MAYTAPI_PRODUCT_ID = process.env.MAYTAPI_PRODUCT_ID;
+const DEVICE_ID = process.env.DEVICE_ID;
+const MAYTAPI_KEY = process.env.MAYTAPI_KEY;
 
-const API_URL = `https://api.maytapi.com/api/${process.env.MAYTAPI_PRODUCT_ID}/${process.env.MAYTAPI_PHONE_ID}/checkPhones`;
+const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || "150", 10);
+const RATE_LIMIT_MS = parseInt(process.env.RATE_LIMIT_MS || "1000", 10);
+const MAX_INPUT_NUMBERS = parseInt(process.env.MAX_INPUT_NUMBERS || "2000", 10);
 
-async function checkNumbers(numbers) {
-  const chunkSize = 150;
-  const results = [];
-
-  for (let i = 0; i < numbers.length; i += chunkSize) {
-    const part = numbers.slice(i, i + chunkSize);
-
-    const res = await axios.post(
-      API_URL,
-      { numbers: part },
-      { headers: { "x-maytapi-key": process.env.MAYTAPI_KEY } }
-    );
-
-    results.push(...res.data.data);
-  }
-  return results;
+// ====== VALIDATE ======
+if (!BOT_TOKEN || !MAYTAPI_PRODUCT_ID || !DEVICE_ID || !MAYTAPI_KEY) {
+  console.error("❌ Missing environment variables (.env)।");
+  process.exit(1);
 }
 
-bot.on("message", async (msg) => {
-  const chatId = msg.chat.id;
+const bot = new Telegraf(BOT_TOKEN);
 
-  // ✅ User sent TXT file
-  if (msg.document && msg.document.mime_type === "text/plain") {
-    const file = await bot.getFile(msg.document.file_id);
-    const filePath = `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${file.file_path}`;
+// Extract numbers
+function extractNumbers(text) {
+  return text
+    .split(/[\s,\n;|]+/)
+    .map(n => n.replace(/\D/g, ""))
+    .filter(n => n.length > 0);
+}
 
-    bot.sendMessage(chatId, "📥 File Received\nProcessing...");
+// Chunk array
+function chunk(arr, size) {
+  let out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
 
-    const fileData = await axios.get(filePath);
-    var numbers = fileData.data.toString().split(/\r?\n/).filter(Boolean);
-  }
-  else {
-    // ✅ User sent normal text numbers
-    const text = msg.text.trim();
-    numbers = text.split(/[\s,]+/).filter(Boolean);
-  }
-
-  bot.sendMessage(chatId, `🔍 Checking ${numbers.length} numbers...\nPlease wait...`);
-
+async function processNumbers(ctx, allNumbers) {
   try {
-    const results = await checkNumbers(numbers);
+    const numbers = Array.from(new Set(allNumbers.map(n => n.trim()).filter(Boolean)));
+    if (!numbers.length) return ctx.reply("⚠️ কোনো নম্বর পাওয়া যায়নি।");
 
-    const valid = results.filter(x => x.valid).map(x => x.id._serialized);
-    const invalid = results.filter(x => !x.valid).map(x => (x.id.user ?? x.id));
+    if (numbers.length > MAX_INPUT_NUMBERS)
+      return ctx.reply(`⚠️ একবারে সর্বোচ্চ ${MAX_INPUT_NUMBERS} নম্বর চেক করা যাবে।`);
 
-    // ✅ Create invalid list text file
-    const fileName = `invalid_${Date.now()}.txt`;
-    fs.writeFileSync(fileName, invalid.join("\n"));
+    const batches = chunk(numbers, BATCH_SIZE);
+    const url = `https://api.maytapi.com/api/${MAYTAPI_PRODUCT_ID}/${DEVICE_ID}/checkPhones`;
 
-    const summary = `
-✅ **WhatsApp Check Summary**
-━━━━━━━━━━━━━━
-📌 Total Numbers: ${numbers.length}
-🟢 WhatsApp Found: ${valid.length}
-🔴 WhatsApp Not Found: ${invalid.length}
-━━━━━━━━━━━━━━
-`;
+    let wpFound = 0;
+    let wpNotFound = [];
+    let checked = 0;
 
-    await bot.sendMessage(chatId, summary, { parse_mode: "Markdown" });
+    for (let batch of batches) {
+      let resp;
+      try {
+        resp = await axios.post(
+          url,
+          { numbers: batch },
+          {
+            headers: {
+              accept: "application/json",
+              "x-maytapi-key": MAYTAPI_KEY,
+              "Content-Type": "application/json"
+            },
+            timeout: 45000
+          }
+        );
+      } catch {
+        batch.forEach(n => wpNotFound.push(n)); 
+        continue;
+      }
 
-    if (invalid.length > 0) {
-      await bot.sendDocument(chatId, fileName, { caption: "📄 Numbers without WhatsApp" });
+      resp.data.data.forEach((r, i) => {
+        const num = batch[i];
+        if (r.valid === true || r.status === "valid") wpFound++;
+        else wpNotFound.push(num);
+        checked++;
+      });
+
+      await new Promise(r => setTimeout(r, RATE_LIMIT_MS));
     }
 
-    fs.unlinkSync(fileName);
+    const summary =
+      `✅ *Result Completed*\n\n` +
+      `🔢 Total Input: *${numbers.length}*\n` +
+      `🔎 Checked: *${checked}*\n` +
+      `✅ WhatsApp Found: *${wpFound}*\n` +
+      `❌ Not Found: *${wpNotFound.length}*\n`;
 
-  } catch (err) {
-    bot.sendMessage(chatId, "❌ Error checking numbers.\nCheck API or Contact Admin");
-    console.log(err.message);
+    await ctx.reply(summary, { parse_mode: "Markdown" });
+
+    if (wpNotFound.length) {
+      const content = wpNotFound.join("\n");
+      await ctx.replyWithDocument({ source: Buffer.from(content), filename: "not_found.txt" });
+    }
+
+  } catch (e) {
+    console.error(e);
+    ctx.reply("⚠️ Error occurred. Try again later.");
   }
+}
+
+// Text messages
+bot.on("text", async (ctx) => {
+  const nums = extractNumbers(ctx.message.text);
+  await processNumbers(ctx, nums);
 });
 
-// ✅ Keep bot online (for Render / UptimeRobot)
+// TXT file support
+bot.on("document", async (ctx) => {
+  const file = ctx.message.document;
+  if (!file.file_name.endsWith(".txt"))
+    return ctx.reply("⚠️ শুধু `.txt` ফাইল পাঠান।");
+
+  const link = await ctx.telegram.getFileLink(file.file_id);
+  const res = await axios.get(link.href);
+  const nums = extractNumbers(res.data);
+  await processNumbers(ctx, nums);
+});
+
+// /start
+bot.start((ctx) =>
+  ctx.reply("👋 Bot is Ready.\n\nSimply send numbers OR upload .txt file.\nBot will check WhatsApp availability.\nNo country code auto-add.\nNumbers → যেভাবে পাঠাবে ঠিক সেভাবেই চেক হবে ✅")
+);
+
+// Launch bot
+bot.launch();
+console.log("✅ Bot Started");
+
+// ====== Render Keep Alive ======
 const app = express();
-app.get("/", (req, res) => res.send("Bot is Running ✅"));
-app.listen(3000, () => console.log("Server running on port 3000"));
+app.get("/", (req, res) => res.send("Bot Running ✅"));
+app.listen(process.env.PORT || 3000, () => console.log("🌍 Uptime server active"));
